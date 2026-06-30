@@ -63,7 +63,19 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: bash -c "rm -f /rails/tmp/pids/server.pid && bundle install && bundle exec rails db:create && bundle exec rails db:migrate && bundle exec rails s -p 3001 -b 0.0.0.0"
+    command: bash -c "rm -f /rails/tmp/pids/server.pid && bundle exec rails db:prepare && bundle exec rails s -p 3001 -b 0.0.0.0"
+    labels:
+      - "traefik.enable=true"
+      # IMPORTANTE: Todo path de API que pertence ao evo-auth DEVE estar listado aqui.
+      # Paths admin (como /api/v1/permissions, /api/v1/resource_actions, /api/v1/roles)
+      # NÃO são cobertos por /api/v1/auth — precisam ser explicitamente incluídos.
+      # Se esquecer de incluir um path aqui, ele cai no evo-crm (PathPrefix /api/v1, priority 50)
+      # e o frontend recebe 404, resultando em "Access Denied" ou página em branco.
+      - "traefik.http.routers.evo-auth.rule=Host(`api.cicloia.com.br`) && (PathPrefix(`/api/v1/auth`) || PathPrefix(`/api/v1/permissions`) || PathPrefix(`/api/v1/resource_actions`) || PathPrefix(`/api/v1/roles`) || PathPrefix(`/api/v1/users`) || PathPrefix(`/api/v1/features`) || PathPrefix(`/api/v1/plans`) || PathPrefix(`/api/v1/user_tours`) || PathPrefix(`/api/v1/oauth_applications`) || PathPrefix(`/api/v1/profile`) || PathPrefix(`/api/v1/account`) || PathPrefix(`/api/v1/access_tokens`) || PathPrefix(`/api/v1/mfa`) || PathPrefix(`/api/v1/data_privacy`) || PathPrefix(`/api/v1/setup_survey`) || PathPrefix(`/api/v1/dynamic_oauth`) || PathPrefix(`/oauth`) || PathPrefix(`/setup`))"
+      - "traefik.http.routers.evo-auth.entrypoints=websecure"
+      - "traefik.http.routers.evo-auth.priority=100"
+      - "traefik.http.routers.evo-auth.tls.certresolver=letsencrypt"
+      - "traefik.http.services.evo-auth.loadbalancer.server.port=3001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
       interval: 30s
@@ -132,6 +144,13 @@ services:
         condition: service_healthy
     entrypoint: docker/entrypoints/rails.sh
     command: ["bundle", "exec", "rails", "s", "-p", "3000", "-b", "0.0.0.0"]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evo-crm.rule=Host(`api.cicloia.com.br`) && PathPrefix(`/api/v1`)"
+      - "traefik.http.routers.evo-crm.entrypoints=websecure"
+      - "traefik.http.routers.evo-crm.priority=50"
+      - "traefik.http.routers.evo-crm.tls.certresolver=letsencrypt"
+      - "traefik.http.services.evo-crm.loadbalancer.server.port=3000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health/live"]
       interval: 30s
@@ -279,26 +298,34 @@ services:
       context: ./evo-ai-frontend-community
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
-        VITE_AUTH_API_URL: ${VITE_AUTH_API_URL:-http://localhost:3001}
-        VITE_EVOAI_API_URL: ${VITE_EVOAI_API_URL:-http://localhost:5555}
-        VITE_AGENT_PROCESSOR_URL: ${VITE_AGENT_PROCESSOR_URL:-http://localhost:8000}
+        VITE_API_URL: ${VITE_API_URL:-https://api.cicloia.com.br}
+        VITE_AUTH_API_URL: ${VITE_AUTH_API_URL:-https://api.cicloia.com.br}
+        VITE_EVOAI_API_URL: ${VITE_EVOAI_API_URL:-https://api.cicloia.com.br}
+        VITE_AGENT_PROCESSOR_URL: ${VITE_AGENT_PROCESSOR_URL:-https://api.cicloia.com.br}
+        VITE_EVOFLOW_API_URL: ${VITE_EVOFLOW_API_URL:-https://api.cicloia.com.br}
     restart: unless-stopped
     environment:
-      VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
-      VITE_AUTH_API_URL: ${VITE_AUTH_API_URL:-http://localhost:3001}
-      VITE_WS_URL: ${VITE_WS_URL:-http://localhost:3000}
-      VITE_EVOAI_API_URL: ${VITE_EVOAI_API_URL:-http://localhost:5555}
-      VITE_AGENT_PROCESSOR_URL: ${VITE_AGENT_PROCESSOR_URL:-http://localhost:8000}
+      VITE_API_URL: ${VITE_API_URL:-https://api.cicloia.com.br}
+      VITE_AUTH_API_URL: ${VITE_AUTH_API_URL:-https://api.cicloia.com.br}
+      VITE_WS_URL: ${VITE_WS_URL:-https://api.cicloia.com.br}
+      VITE_EVOAI_API_URL: ${VITE_EVOAI_API_URL:-https://api.cicloia.com.br}
+      VITE_AGENT_PROCESSOR_URL: ${VITE_AGENT_PROCESSOR_URL:-https://api.cicloia.com.br}
+      VITE_EVOFLOW_API_URL: ${VITE_EVOFLOW_API_URL:-https://api.cicloia.com.br}
     ports:
       - "5173:80"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evo-frontend.rule=Host(`crm.cicloia.com.br`)"
+      - "traefik.http.routers.evo-frontend.entrypoints=websecure"
+      - "traefik.http.routers.evo-frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.services.evo-frontend.loadbalancer.server.port=80"
     depends_on:
       evo-auth:
         condition: service_healthy
       evo-crm:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:80/health"]
       interval: 15s
       timeout: 5s
       retries: 3

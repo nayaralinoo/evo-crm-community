@@ -1,0 +1,277 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE:-evocrm}
+      POSTGRES_USER: ${POSTGRES_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USERNAME:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # API Gateway (Nginx) — Port 3030 (internal, accessed via Traefik)
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "3030"
+    environment:
+      AUTH_UPSTREAM: auth:3001
+      CRM_UPSTREAM: evo-crm:3000
+      CORE_UPSTREAM: core:5555
+      PROCESSOR_UPSTREAM: processor:8000
+      BOT_RUNTIME_UPSTREAM: bot-runtime:8080
+    depends_on:
+      auth:
+        condition: service_healthy
+      evo-crm:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evo-gateway.rule=Host(`api.cicloia.com.br`)"
+      - "traefik.http.routers.evo-gateway.entrypoints=websecure"
+      - "traefik.http.routers.evo-gateway.tls.certresolver=letsencrypt"
+      - "traefik.http.services.evo-gateway.loadbalancer.server.port=3030"
+
+  # ---------------------------------------------------------------------------
+  # Auth Service (Ruby / Rails) — Port 3001
+  # ---------------------------------------------------------------------------
+  auth:
+    image: evoapicloud/evo-auth-service-community:latest
+    restart: unless-stopped
+    command: sh -c "bundle exec rails db:prepare && bundle exec rails s -p 3001 -b 0.0.0.0"
+    expose:
+      - "3001"
+    env_file: .env
+    environment:
+      RAILS_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      POSTGRES_HOST: postgres
+    volumes:
+      - auth_storage:/rails/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  auth-sidekiq:
+    image: evoapicloud/evo-auth-service-community:latest
+    restart: unless-stopped
+    command: sh -c "bundle exec sidekiq"
+    env_file: .env
+    environment:
+      RAILS_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      POSTGRES_HOST: postgres
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # CRM Service (Ruby / Rails) — Port 3000
+  # ---------------------------------------------------------------------------
+  crm:
+    image: evoapicloud/evo-ai-crm-community:latest
+    restart: unless-stopped
+    command: sh -c "bundle exec rails db:prepare && bundle exec rails s -p 3000 -b 0.0.0.0"
+    expose:
+      - "3000"
+    env_file: .env
+    environment:
+      RAILS_ENV: production
+      RAILS_SERVE_STATIC_FILES: "true"
+      RAILS_LOG_TO_STDOUT: "true"
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      POSTGRES_HOST: postgres
+      EVO_AUTH_SERVICE_URL: http://auth:3001
+      EVO_AI_CORE_SERVICE_URL: http://core:5555
+      BOT_RUNTIME_URL: http://bot-runtime:8080
+      BOT_RUNTIME_POSTBACK_BASE_URL: https://api.cicloia.com.br
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  crm-sidekiq:
+    image: evoapicloud/evo-ai-crm-community:latest
+    restart: unless-stopped
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+    env_file: .env
+    environment:
+      RAILS_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      POSTGRES_HOST: postgres
+      EVO_AUTH_SERVICE_URL: http://auth:3001
+      EVO_AI_CORE_SERVICE_URL: http://core:5555
+      BOT_RUNTIME_URL: http://bot-runtime:8080
+      BOT_RUNTIME_POSTBACK_BASE_URL: https://api.cicloia.com.br
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Core Service (Go / Gin) — Port 5555
+  # ---------------------------------------------------------------------------
+  core:
+    image: evoapicloud/evo-ai-core-service-community:latest
+    restart: unless-stopped
+    expose:
+      - "5555"
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USERNAME:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DATABASE:-evocrm}
+      DB_SSLMODE: disable
+      PORT: "5555"
+      EVOLUTION_BASE_URL: http://crm:3000
+      EVO_AUTH_BASE_URL: http://auth:3001
+      AI_PROCESSOR_URL: http://processor:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5555/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Processor Service (Python / FastAPI) — Port 8000
+  # ---------------------------------------------------------------------------
+  processor:
+    image: evoapicloud/evo-ai-processor-community:latest
+    restart: unless-stopped
+    command: sh -c "alembic upgrade head 2>&1 || true; python -m scripts.run_seeders; uvicorn src.main:app --host $$HOST --port $$PORT"
+    expose:
+      - "8000"
+    env_file: .env
+    environment:
+      POSTGRES_CONNECTION_STRING: postgresql://${POSTGRES_USERNAME:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DATABASE:-evocrm}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_SSL: "false"
+      REDIS_DB: 0
+      HOST: 0.0.0.0
+      PORT: "8000"
+      EVO_AI_CRM_URL: http://crm:3000
+      CORE_SERVICE_URL: http://core:5555/api/v1
+      APP_URL: https://api.cicloia.com.br
+      API_URL: https://api.cicloia.com.br
+    volumes:
+      - processor_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Bot Runtime (Go / Gin) — Port 8080
+  # ---------------------------------------------------------------------------
+  bot-runtime:
+    image: evoapicloud/evo-bot-runtime:latest
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      AI_PROCESSOR_URL: http://processor:8000
+      BOT_RUNTIME_SECRET: ${BOT_RUNTIME_SECRET}
+      AI_CALL_TIMEOUT_SECONDS: 30
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Frontend (React / Vite / Nginx) — Port 80 (internal, accessed via Traefik)
+  # ---------------------------------------------------------------------------
+  evo-frontend:
+    ports: []
+    expose:
+      - "80"
+    environment:
+      VITE_APP_ENV: production
+      VITE_API_URL: https://api.cicloia.com.br
+      VITE_AUTH_API_URL: https://api.cicloia.com.br
+      VITE_EVOAI_API_URL: https://api.cicloia.com.br
+      VITE_AGENT_PROCESSOR_URL: https://api.cicloia.com.br
+      VITE_WS_URL: https://api.cicloia.com.br
+      VITE_EVOFLOW_API_URL: https://api.cicloia.com.br
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evo-frontend.rule=Host(`crm.cicloia.com.br`)"
+      - "traefik.http.routers.evo-frontend.entrypoints=websecure"
+      - "traefik.http.routers.evo-frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.services.evo-frontend.loadbalancer.server.port=80"
+
+volumes:
+  postgres_data:
+  redis_data:
+  auth_storage:
+  processor_logs:
